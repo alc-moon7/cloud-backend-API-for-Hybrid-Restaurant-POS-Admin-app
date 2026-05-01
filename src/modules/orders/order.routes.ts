@@ -7,7 +7,12 @@ import { requiredParam } from '../../shared/params.js';
 import { parseOptionalDate } from '../../shared/time.js';
 import { withIdempotency } from '../sync/idempotency.service.js';
 import { orderStatuses } from './order-status.js';
-import { listOrders, updateOrderStatus, upsertOrder } from './order.service.js';
+import {
+  getOrderById,
+  listOrders,
+  updateOrderStatus,
+  upsertOrder,
+} from './order.service.js';
 
 const orderItemSchema = z.object({
   id: z.string().optional(),
@@ -65,6 +70,16 @@ orderRouter.post(
       broadcast({ type: 'order_created', data: order });
       return { statusCode: 201, body: { ok: true, data: order } };
     });
+  }),
+);
+
+orderRouter.get(
+  '/:id',
+  asyncHandler(async (request, response) => {
+    const outletId = requiredParam(request.params.outletId, 'outletId');
+    const id = requiredParam(request.params.id, 'id');
+    const order = await getOrderById(outletId, id);
+    response.json({ ok: true, data: order });
   }),
 );
 

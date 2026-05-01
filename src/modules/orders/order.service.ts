@@ -63,6 +63,16 @@ export async function listOrders(
   return hydrateOrders(result.rows);
 }
 
+export async function getOrderById(outletId: string, id: string) {
+  const result = await pool.query(
+    'SELECT * FROM orders WHERE id = $1 AND outlet_id = $2 LIMIT 1',
+    [id, outletId],
+  );
+  if (!result.rowCount) throw notFound('Order was not found.');
+  const items = await getOrderItemRows(pool, id);
+  return mapOrderRow(result.rows[0], items);
+}
+
 export async function upsertOrder(outletId: string, input: OrderInput) {
   if (!input.items.length) throw badRequest('Order must include at least one item.');
 
