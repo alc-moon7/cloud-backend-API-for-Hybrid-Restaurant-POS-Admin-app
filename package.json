@@ -29,6 +29,7 @@
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
     "@types/ws": "^8.5.13",
+    "supabase": "^2.98.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

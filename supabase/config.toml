@@ -1,0 +1,2 @@
+[functions.pos-api]
+verify_jwt = false
