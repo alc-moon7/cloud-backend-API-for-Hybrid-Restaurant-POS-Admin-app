@@ -2,9 +2,11 @@ import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import swaggerUi from 'swagger-ui-express';
 
 import { env } from './config/env.js';
 import { pool } from './db/pool.js';
+import { openApiSpec } from './docs/openapi.js';
 import {
   authMiddleware,
   errorMiddleware,
@@ -18,6 +20,21 @@ import { connectedClientCount } from './realtime/hub.js';
 
 export function createApp() {
   const app = express();
+
+  app.get('/openapi.json', (_request, response) => {
+    response.json(openApiSpec);
+  });
+  app.use(
+    '/api-docs',
+    swaggerUi.serve,
+    swaggerUi.setup(openApiSpec, {
+      explorer: true,
+      customSiteTitle: 'Hybrid POS API Docs',
+      swaggerOptions: {
+        persistAuthorization: true,
+      },
+    }),
+  );
 
   app.use(helmet());
   app.use(
