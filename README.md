@@ -43,9 +43,11 @@ supabase db push
 supabase functions deploy pos-api --no-verify-jwt
 ```
 
-`--no-verify-jwt` is intentional for this MVP because the Admin APK should not
-need a manually pasted API key. Add restaurant/device authentication before
-public multi-tenant production.
+`--no-verify-jwt` is intentional because the Admin APK does not use Supabase
+user JWT login. Production tenant security is handled by the Edge Function:
+the app calls `POST /tenants/bootstrap` once, receives a private device token,
+and then sends that token as `Authorization: Bearer <deviceToken>` for Admin
+sync/write APIs. Restaurant owners never paste API keys manually.
 
 6. Test the live function:
 
@@ -73,7 +75,8 @@ flutter build apk --release \
   --dart-define=POS_CLOUD_SYNC_ENABLED=true
 ```
 
-After this, the Admin app does not require a manual Device token / API key.
+The production Supabase URL can also be built into the app as the default. After
+first launch, the Admin app creates the restaurant/outlet identity automatically.
 
 ### Cloud realtime
 
@@ -113,9 +116,11 @@ writes still go through the Edge Function service role.
 ### Supabase API endpoints
 
 - `GET /health`
+- `POST /tenants/bootstrap`
 - `POST /devices/register`
 - `POST /devices/heartbeat`
 - `GET /outlets/:outletId/menu`
+- `POST /outlets/:outletId/menu/images`
 - `POST /outlets/:outletId/menu`
 - `PATCH /outlets/:outletId/menu/:id`
 - `DELETE /outlets/:outletId/menu/:id`
@@ -127,6 +132,24 @@ writes still go through the Edge Function service role.
 - `POST /outlets/:outletId/sync/push`
 
 All write endpoints accept `Idempotency-Key`.
+
+Admin-only endpoints require the device token issued by
+`POST /tenants/bootstrap`:
+
+- `POST/PATCH/DELETE /outlets/:outletId/menu`
+- `POST /outlets/:outletId/menu/images`
+- `GET /outlets/:outletId/orders`
+- `PATCH /outlets/:outletId/orders/:id/status`
+- `GET /outlets/:outletId/sync/pull`
+- `POST /outlets/:outletId/sync/push`
+- `POST /devices/register`
+- `POST /devices/heartbeat`
+
+Customer-facing endpoints remain public by `outletId`:
+
+- `GET /outlets/:outletId/menu`
+- `POST /outlets/:outletId/orders`
+- `GET /outlets/:outletId/orders/:id`
 
 ## Legacy: Express + PostgreSQL
 

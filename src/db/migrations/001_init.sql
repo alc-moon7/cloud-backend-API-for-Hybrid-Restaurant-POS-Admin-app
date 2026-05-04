@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS devices (
   local_ip TEXT,
   local_port INTEGER,
   local_server_running BOOLEAN NOT NULL DEFAULT false,
+  device_token_hash TEXT,
+  token_issued_at TIMESTAMPTZ,
+  is_active BOOLEAN NOT NULL DEFAULT true,
   last_heartbeat_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -114,3 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_outlet_status
 
 CREATE INDEX IF NOT EXISTS idx_sync_events_outlet_updated
   ON sync_events(outlet_id, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_devices_outlet_token
+  ON devices(outlet_id, device_token_hash)
+  WHERE device_token_hash IS NOT NULL AND is_active = true;

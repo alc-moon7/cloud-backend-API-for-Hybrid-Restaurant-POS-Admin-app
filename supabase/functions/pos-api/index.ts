@@ -89,6 +89,7 @@ const statusPriority: Record<string, number> = {
 
 const orderStatuses = new Set(Object.keys(statusPriority));
 const realtimeTopicPrefix = 'pos:outlet:';
+const menuImageBucket = 'menu-images';
 
 let cachedClient: SupabaseClient | null = null;
 
@@ -110,10 +111,18 @@ Deno.serve(async (request) => {
 
     if (
       request.method === 'POST' &&
+      segments[0] === 'tenants' &&
+      segments[1] === 'bootstrap'
+    ) {
+      return withIdempotency(request, () => bootstrapTenant(request));
+    }
+
+    if (
+      request.method === 'POST' &&
       segments[0] === 'devices' &&
       segments[1] === 'register'
     ) {
-      return withIdempotency(request, () => registerDevice(request));
+      return json((await registerDevice(request)).body);
     }
 
     if (
@@ -121,23 +130,38 @@ Deno.serve(async (request) => {
       segments[0] === 'devices' &&
       segments[1] === 'heartbeat'
     ) {
-      return withIdempotency(request, () => heartbeatDevice(request));
+      return json((await heartbeatDevice(request)).body);
     }
 
     if (segments[0] === 'outlets' && segments[2] === 'menu') {
       const outletId = requiredSegment(segments[1], 'outletId');
+      if (
+        request.method === 'POST' &&
+        segments.length === 4 &&
+        segments[3] === 'images'
+      ) {
+        await requireAdminForOutlet(request, outletId);
+        return withIdempotency(request, () => uploadMenuImage(outletId, request));
+      }
       if (request.method === 'GET' && segments.length === 3) {
         return json(await listMenu(outletId, url));
       }
       if (request.method === 'POST' && segments.length === 3) {
+        await requireAdminForOutlet(request, outletId);
         return withIdempotency(request, () => createMenuItem(outletId, request));
       }
       if (request.method === 'PATCH' && segments.length === 4) {
+        await requireAdminForOutlet(request, outletId);
         return withIdempotency(request, () =>
-          patchMenuItem(outletId, requiredSegment(segments[3], 'id'), request)
+          patchMenuItem(
+            outletId,
+            requiredSegment(segments[3], 'id'),
+            request,
+          )
         );
       }
       if (request.method === 'DELETE' && segments.length === 4) {
+        await requireAdminForOutlet(request, outletId);
         return withIdempotency(request, () =>
           deleteMenuItem(outletId, requiredSegment(segments[3], 'id'))
         );
@@ -147,6 +171,7 @@ Deno.serve(async (request) => {
     if (segments[0] === 'outlets' && segments[2] === 'orders') {
       const outletId = requiredSegment(segments[1], 'outletId');
       if (request.method === 'GET' && segments.length === 3) {
+        await requireAdminForOutlet(request, outletId);
         return json(await listOrders(outletId, url));
       }
       if (request.method === 'POST' && segments.length === 3) {
@@ -163,8 +188,13 @@ Deno.serve(async (request) => {
         segments.length === 5 &&
         segments[4] === 'status'
       ) {
+        await requireAdminForOutlet(request, outletId);
         return withIdempotency(request, () =>
-          patchOrderStatus(outletId, requiredSegment(segments[3], 'id'), request)
+          patchOrderStatus(
+            outletId,
+            requiredSegment(segments[3], 'id'),
+            request,
+          )
         );
       }
     }
@@ -176,6 +206,7 @@ Deno.serve(async (request) => {
         segments.length === 4 &&
         segments[3] === 'pull'
       ) {
+        await requireAdminForOutlet(request, outletId);
         return json(await pullSync(outletId, url));
       }
       if (
@@ -183,6 +214,7 @@ Deno.serve(async (request) => {
         segments.length === 4 &&
         segments[3] === 'push'
       ) {
+        await requireAdminForOutlet(request, outletId);
         return withIdempotency(request, () => pushSync(outletId, request));
       }
     }
@@ -254,6 +286,56 @@ async function health() {
   };
 }
 
+async function bootstrapTenant(request: Request): Promise<ActionResult> {
+  const body = await readJson(request);
+  const serverId = requireString(body.serverId, 'serverId');
+  const restaurantName = requireString(body.restaurantName, 'restaurantName');
+  const outletName = requireString(body.outletName, 'outletName');
+  const restaurantId = optionalString(body.restaurantId, 'restaurantId') ??
+    makePublicId('rest');
+  const outletId = optionalString(body.outletId, 'outletId') ??
+    makePublicId('outlet');
+  const now = new Date().toISOString();
+  const deviceToken = makeDeviceToken();
+  const tokenHash = await sha256Hex(deviceToken);
+
+  await ensureRestaurantOutlet({
+    restaurantId,
+    outletId,
+    restaurantName,
+    outletName,
+  });
+
+  const device = await upsertSingle('devices', {
+    id: serverId,
+    restaurant_id: restaurantId,
+    outlet_id: outletId,
+    restaurant_name: restaurantName,
+    outlet_name: outletName,
+    device_token_hash: tokenHash,
+    token_issued_at: now,
+    is_active: true,
+    updated_at: now,
+  });
+
+  const payload = {
+    serverId,
+    restaurantId,
+    outletId,
+    restaurantName,
+    outletName,
+    deviceToken,
+    cloudSyncEnabled: true,
+    device,
+  };
+
+  await broadcastToOutlet(outletId, 'device_registered', {
+    ...device,
+    device_token_hash: undefined,
+  });
+  return { statusCode: 201, body: { ok: true, data: payload } };
+}
+
 async function registerDevice(request: Request): Promise<ActionResult> {
   const body = await readJson(request);
   const input = {
@@ -263,6 +345,7 @@ async function registerDevice(request: Request): Promise<ActionResult> {
     restaurantName: requireString(body.restaurantName, 'restaurantName'),
     outletName: requireString(body.outletName, 'outletName'),
   };
+  await requireAdminForOutlet(request, input.outletId, input.serverId);
   await ensureRestaurantOutlet(input);
   const row = await upsertSingle('devices', {
     id: input.serverId,
@@ -270,6 +353,7 @@ async function registerDevice(request: Request): Promise<ActionResult> {
     outlet_id: input.outletId,
     restaurant_name: input.restaurantName,
     outlet_name: input.outletName,
+    is_active: true,
     updated_at: new Date().toISOString(),
   });
   await broadcastToOutlet(input.outletId, 'device_registered', row);
@@ -286,6 +370,7 @@ async function heartbeatDevice(request: Request): Promise<ActionResult> {
     port: nullableNumber(body.port),
     localServerRunning: booleanOr(body.localServerRunning, false),
   };
+  await requireAdminForOutlet(request, input.outletId, input.serverId);
   await ensureRestaurantOutlet({
     restaurantId: input.restaurantId,
     outletId: input.outletId,
@@ -343,6 +428,61 @@ async function createMenuItem(
   const item = await upsertMenuItem(outletId, input);
   await broadcastToOutlet(outletId, 'menu_updated', item);
   return { statusCode: 200, body: { ok: true, data: item } };
+}
+
+async function uploadMenuImage(
+  outletId: string,
+  request: Request,
+): Promise<ActionResult> {
+  const body = await readJson(request);
+  const dataUrl = optionalString(body.dataUrl, 'dataUrl');
+  const rawBase64 = optionalString(body.base64, 'base64');
+  if (!dataUrl && !rawBase64) {
+    throw new ApiError(400, 'dataUrl or base64 is required.');
+  }
+
+  const parsed = dataUrl
+    ? parseImageDataUrl(dataUrl)
+    : {
+      contentType: optionalString(body.contentType, 'contentType') ??
+        'image/jpeg',
+      base64: rawBase64!,
+    };
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(parsed.contentType)) {
+    throw new ApiError(400, 'Only JPEG, PNG, and WEBP images are allowed.');
+  }
+
+  const bytes = decodeBase64(parsed.base64);
+  if (bytes.length === 0) throw new ApiError(400, 'Image payload is empty.');
+  if (bytes.length > 5 * 1024 * 1024) {
+    throw new ApiError(400, 'Image must be 5MB or smaller.');
+  }
+
+  const fileName = optionalString(body.fileName, 'fileName') ??
+    `${crypto.randomUUID()}${extensionForContentType(parsed.contentType)}`;
+  const objectPath = `${outletId}/${Date.now()}-${sanitizeFileName(fileName)}`;
+  const { error } = await db().storage
+    .from(menuImageBucket)
+    .upload(objectPath, new Blob([bytes], { type: parsed.contentType }), {
+      contentType: parsed.contentType,
+      upsert: true,
+    });
+  throwIf(error);
+
+  const { data } = db().storage.from(menuImageBucket).getPublicUrl(objectPath);
+  return {
+    statusCode: 201,
+    body: {
+      ok: true,
+      data: {
+        bucket: menuImageBucket,
+        path: objectPath,
+        publicUrl: data.publicUrl,
+        contentType: parsed.contentType,
+        size: bytes.length,
+      },
+    },
+  };
 }
 
 async function patchMenuItem(
@@ -937,6 +1077,58 @@ async function maybeDeviceRow(id: string) {
   return data;
 }
 
+async function requireAdminForOutlet(
+  request: Request,
+  outletId: string,
+  serverId?: string,
+) {
+  const token = bearerToken(request);
+  if (!token) {
+    throw new ApiError(401, 'Admin device token is required.');
+  }
+  const tokenHash = await sha256Hex(token);
+  let query = db()
+    .from('devices')
+    .select('id, restaurant_id, outlet_id, is_active')
+    .eq('outlet_id', outletId)
+    .eq('device_token_hash', tokenHash)
+    .eq('is_active', true);
+  if (serverId) query = query.eq('id', serverId);
+  const { data, error } = await query.maybeSingle();
+  throwIf(error);
+  if (!data) {
+    throw new ApiError(403, 'Admin device is not authorized for this outlet.');
+  }
+  return data;
+}
+
+function bearerToken(request: Request) {
+  const header = request.headers.get('Authorization')?.trim() ?? '';
+  if (!header.toLowerCase().startsWith('bearer ')) return null;
+  const token = header.slice(7).trim();
+  return token || null;
+}
+
+function makePublicId(prefix: string) {
+  return `${prefix}_${crypto.randomUUID().replaceAll('-', '').slice(0, 18)}`;
+}
+
+function makeDeviceToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `posdt_${btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')}`;
+}
+
+async function sha256Hex(value: string) {
+  const data = new TextEncoder().encode(value);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 function parseOrderInput(body: JsonMap): OrderInput {
   const rawItems = body.items;
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
@@ -1087,6 +1279,46 @@ function stringArray(value: unknown, name: string) {
 function clean(value: string | null | undefined) {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function parseImageDataUrl(value: string) {
+  const match = value.match(/^data:(image\/(?:jpeg|png|webp));base64,(.+)$/);
+  if (!match) {
+    throw new ApiError(400, 'Invalid image data URL.');
+  }
+  return {
+    contentType: match[1],
+    base64: match[2],
+  };
+}
+
+function decodeBase64(value: string) {
+  try {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  } catch (_) {
+    throw new ApiError(400, 'Invalid base64 image payload.');
+  }
+}
+
+function extensionForContentType(contentType: string) {
+  if (contentType === 'image/png') return '.png';
+  if (contentType === 'image/webp') return '.webp';
+  return '.jpg';
+}
+
+function sanitizeFileName(value: string) {
+  const fallback = `menu-image${extensionForContentType('image/jpeg')}`;
+  const cleanName = value
+    .trim()
+    .replaceAll(/[^a-zA-Z0-9._-]/g, '-')
+    .replaceAll(/-+/g, '-')
+    .slice(0, 96);
+  return cleanName || fallback;
 }
 
 function buildOrderNo() {
