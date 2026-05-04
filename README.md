@@ -169,6 +169,28 @@ API base URL:
 http://localhost:4000
 ```
 
+Swagger UI:
+
+```txt
+http://localhost:4000/api-docs
+```
+
+OpenAPI JSON:
+
+```txt
+http://localhost:4000/openapi.json
+```
+
+The Swagger document is generated with `swagger-jsdoc` and served by
+`swagger-ui-express`. It documents the current Express routes, request bodies,
+path/query/header parameters, response examples, error responses, idempotency
+headers, and bearer auth. If `DEVICE_API_TOKEN` is set in `.env`, use the
+Swagger **Authorize** button with:
+
+```txt
+Bearer YOUR_DEVICE_API_TOKEN
+```
+
 Admin WebSocket:
 
 ```txt
