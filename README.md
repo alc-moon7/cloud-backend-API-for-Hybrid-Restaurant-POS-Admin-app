@@ -113,9 +113,62 @@ No manual API key is required inside the app. The migration
 the public/publishable key cannot directly read or write POS tables; all table
 writes still go through the Edge Function service role.
 
+### bKash sandbox activation
+
+The Admin APK uses a payment gate before restaurant setup:
+
+```txt
+Splash -> bKash Sandbox Payment -> Restaurant Setup -> Dashboard
+```
+
+bKash credentials must stay in Supabase secrets, never inside the Flutter APK.
+After bKash gives sandbox PGW credentials, set them like this:
+
+```sh
+cd /home/moon-ahmed/Documents/GitHub/cloud-backend-API-for-Hybrid-Restaurant-POS-Admin-app
+
+npx supabase secrets set \
+  BKASH_MODE=sandbox \
+  BKASH_BASE_URL=https://tokenized.sandbox.bka.sh/v1.2.0-beta/tokenized/checkout \
+  BKASH_APP_KEY=YOUR_SANDBOX_APP_KEY \
+  BKASH_APP_SECRET=YOUR_SANDBOX_APP_SECRET \
+  BKASH_USERNAME=YOUR_SANDBOX_USERNAME \
+  BKASH_PASSWORD=YOUR_SANDBOX_PASSWORD \
+  BKASH_CALLBACK_URL=https://vnhxfvtpkgykatvbrczn.supabase.co/functions/v1/pos-api/payments/bkash/callback
+
+npx supabase functions deploy pos-api --no-verify-jwt
+```
+
+Payment endpoints:
+
+- `POST /payments/bkash/create`
+- `GET /payments/bkash/:paymentId/status`
+- `POST /payments/bkash/:paymentId/verify`
+- `GET /payments/bkash/callback`
+
+The callback executes the bKash payment server-side, stores the session in
+`payment_sessions`, and the app verifies the payment before opening restaurant
+setup.
+
+Sandbox checkout test values after bKash returns a fresh checkout page:
+
+```txt
+Wallet: 01770618575
+OTP: 123456
+PIN: 12121
+```
+
+The sample checkout URL from the bKash demo page is not stored because it is a
+single generated payment session. Production code must always call
+`POST /payments/bkash/create` and use the fresh `bkashURL` returned by bKash.
+
 ### Supabase API endpoints
 
 - `GET /health`
+- `POST /payments/bkash/create`
+- `GET /payments/bkash/:paymentId/status`
+- `POST /payments/bkash/:paymentId/verify`
+- `GET /payments/bkash/callback`
 - `POST /tenants/bootstrap`
 - `POST /devices/register`
 - `POST /devices/heartbeat`

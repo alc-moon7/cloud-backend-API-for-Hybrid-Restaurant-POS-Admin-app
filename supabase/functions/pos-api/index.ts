@@ -68,6 +68,15 @@ type SyncEventInput = {
   updatedAt?: string | null;
 };
 
+type BkashCredentials = {
+  mode: string;
+  baseUrl: string;
+  appKey: string;
+  appSecret: string;
+  username: string;
+  password: string;
+};
+
 class ApiError extends Error {
   constructor(
     readonly statusCode: number,
@@ -90,6 +99,8 @@ const statusPriority: Record<string, number> = {
 const orderStatuses = new Set(Object.keys(statusPriority));
 const realtimeTopicPrefix = 'pos:outlet:';
 const menuImageBucket = 'menu-images';
+const bkashProvider = 'bkash';
+const bkashPurpose = 'admin_activation';
 
 let cachedClient: SupabaseClient | null = null;
 
@@ -109,12 +120,37 @@ Deno.serve(async (request) => {
       return json(await health());
     }
 
+    if (segments[0] === 'payments' && segments[1] === 'bkash') {
+      if (request.method === 'POST' && segments[2] === 'create') {
+        return await withIdempotency(request, () => createBkashPayment(request));
+      }
+      if (
+        request.method === 'GET' &&
+        segments.length === 4 &&
+        segments[3] === 'status'
+      ) {
+        return json(
+          await getBkashPaymentStatus(requiredSegment(segments[2], 'paymentId')),
+        );
+      }
+      if (
+        request.method === 'POST' &&
+        segments.length === 4 &&
+        segments[3] === 'verify'
+      ) {
+        return json(await verifyBkashPayment(requiredSegment(segments[2], 'paymentId')));
+      }
+      if (segments[2] === 'callback') {
+        return bkashCallback(request);
+      }
+    }
+
     if (
       request.method === 'POST' &&
       segments[0] === 'tenants' &&
       segments[1] === 'bootstrap'
     ) {
-      return withIdempotency(request, () => bootstrapTenant(request));
+      return await withIdempotency(request, () => bootstrapTenant(request));
     }
 
     if (
@@ -141,18 +177,18 @@ Deno.serve(async (request) => {
         segments[3] === 'images'
       ) {
         await requireAdminForOutlet(request, outletId);
-        return withIdempotency(request, () => uploadMenuImage(outletId, request));
+        return await withIdempotency(request, () => uploadMenuImage(outletId, request));
       }
       if (request.method === 'GET' && segments.length === 3) {
         return json(await listMenu(outletId, url));
       }
       if (request.method === 'POST' && segments.length === 3) {
         await requireAdminForOutlet(request, outletId);
-        return withIdempotency(request, () => createMenuItem(outletId, request));
+        return await withIdempotency(request, () => createMenuItem(outletId, request));
       }
       if (request.method === 'PATCH' && segments.length === 4) {
         await requireAdminForOutlet(request, outletId);
-        return withIdempotency(request, () =>
+        return await withIdempotency(request, () =>
           patchMenuItem(
             outletId,
             requiredSegment(segments[3], 'id'),
@@ -162,7 +198,7 @@ Deno.serve(async (request) => {
       }
       if (request.method === 'DELETE' && segments.length === 4) {
         await requireAdminForOutlet(request, outletId);
-        return withIdempotency(request, () =>
+        return await withIdempotency(request, () =>
           deleteMenuItem(outletId, requiredSegment(segments[3], 'id'))
         );
       }
@@ -175,7 +211,7 @@ Deno.serve(async (request) => {
         return json(await listOrders(outletId, url));
       }
       if (request.method === 'POST' && segments.length === 3) {
-        return withIdempotency(request, () => createOrder(outletId, request));
+        return await withIdempotency(request, () => createOrder(outletId, request));
       }
       if (request.method === 'GET' && segments.length === 4) {
         return json({
@@ -189,7 +225,7 @@ Deno.serve(async (request) => {
         segments[4] === 'status'
       ) {
         await requireAdminForOutlet(request, outletId);
-        return withIdempotency(request, () =>
+        return await withIdempotency(request, () =>
           patchOrderStatus(
             outletId,
             requiredSegment(segments[3], 'id'),
@@ -215,7 +251,7 @@ Deno.serve(async (request) => {
         segments[3] === 'push'
       ) {
         await requireAdminForOutlet(request, outletId);
-        return withIdempotency(request, () => pushSync(outletId, request));
+        return await withIdempotency(request, () => pushSync(outletId, request));
       }
     }
 
@@ -284,6 +320,198 @@ async function health() {
     latencyMs: Date.now() - startedAt,
     timestamp: new Date().toISOString(),
   };
+}
+
+async function createBkashPayment(request: Request): Promise<ActionResult> {
+  const body = await readJson(request);
+  const serverId = requireString(body.serverId, 'serverId');
+  const amount = requireNumber(body.amount, 'amount');
+  if (amount <= 0) throw new ApiError(400, 'amount must be greater than zero.');
+
+  const currency = optionalString(body.currency, 'currency') ?? 'BDT';
+  if (currency !== 'BDT') throw new ApiError(400, 'Only BDT is supported.');
+
+  const credentials = bkashCredentials();
+  const callbackURL = bkashCallbackUrl(request);
+  const merchantInvoiceNumber = buildBkashInvoice(serverId);
+  const paymentBody = {
+    mode: '0011',
+    payerReference: serverId,
+    callbackURL,
+    amount: amount.toFixed(2),
+    currency,
+    intent: 'sale',
+    merchantInvoiceNumber,
+  };
+  const created = await bkashRequest('/create', paymentBody, credentials);
+  const paymentID = stringFrom(created.paymentID ?? created.paymentId);
+  const checkoutUrl = stringFrom(created.bkashURL ?? created.bKashURL);
+  if (!paymentID || !checkoutUrl) {
+    throw new ApiError(502, 'bKash did not return a payment URL.', created);
+  }
+
+  const row = await upsertSingle('payment_sessions', {
+    id: crypto.randomUUID(),
+    server_id: serverId,
+    provider: bkashProvider,
+    mode: credentials.mode,
+    purpose: optionalString(body.purpose, 'purpose') ?? bkashPurpose,
+    amount,
+    currency,
+    merchant_invoice_number: merchantInvoiceNumber,
+    payment_id: paymentID,
+    checkout_url: checkoutUrl,
+    status: 'created',
+    raw_create: created,
+    updated_at: new Date().toISOString(),
+  });
+
+  return {
+    statusCode: 201,
+    body: {
+      ok: true,
+      data: mapPaymentSession(row),
+    },
+  };
+}
+
+async function bkashCallback(request: Request) {
+  const url = new URL(request.url);
+  const callbackBody = await safeCallbackBody(request);
+  const paymentId = url.searchParams.get('paymentID') ??
+    url.searchParams.get('paymentId') ??
+    optionalString(callbackBody.paymentID, 'paymentID') ??
+    optionalString(callbackBody.paymentId, 'paymentId');
+  const status = url.searchParams.get('status')?.toLowerCase() ?? '';
+  if (!paymentId) {
+    return html(paymentHtml('Payment not found', false));
+  }
+
+  try {
+    if (status === 'success') {
+      await executeBkashPayment(paymentId);
+      return html(paymentHtml('Payment successful. You can return to REs Admin.', true));
+    }
+    await updatePaymentSession(paymentId, {
+      status: status === 'cancel' || status === 'cancelled' ? 'cancelled' : 'failed',
+      last_error: status || 'bKash payment was not completed.',
+      updated_at: new Date().toISOString(),
+    });
+    return html(paymentHtml('Payment was not completed. Please try again.', false));
+  } catch (error) {
+    await updatePaymentSession(paymentId, {
+      status: 'failed',
+      last_error: error instanceof Error ? error.message : 'Payment execution failed.',
+      updated_at: new Date().toISOString(),
+    });
+    return html(paymentHtml('Payment verification failed. Please retry from the app.', false));
+  }
+}
+
+async function getBkashPaymentStatus(paymentId: string) {
+  const row = await maybePaymentSession(paymentId);
+  if (!row) throw new ApiError(404, 'Payment session was not found.');
+  return { ok: true, data: mapPaymentSession(row) };
+}
+
+async function verifyBkashPayment(paymentId: string) {
+  const row = await maybePaymentSession(paymentId);
+  if (!row) throw new ApiError(404, 'Payment session was not found.');
+  if (row.status === 'paid') {
+    return { ok: true, data: mapPaymentSession(row) };
+  }
+
+  const status = await queryBkashPayment(paymentId);
+  const transactionStatus = stringFrom(status.transactionStatus).toLowerCase();
+  const trxID = stringFrom(status.trxID ?? status.trxId ?? status.transactionId);
+  const paid = transactionStatus === 'completed' || Boolean(trxID);
+  const updated = await updatePaymentSession(paymentId, {
+    status: paid ? 'paid' : String(row.status ?? 'created'),
+    transaction_id: trxID || stringFrom(row.transaction_id) || null,
+    raw_status: status,
+    updated_at: new Date().toISOString(),
+  });
+  return { ok: true, data: mapPaymentSession(updated) };
+}
+
+async function executeBkashPayment(paymentId: string) {
+  const credentials = bkashCredentials();
+  const executed = await bkashRequest('/execute', { paymentID: paymentId }, credentials);
+  const trxID = stringFrom(executed.trxID ?? executed.trxId ?? executed.transactionId);
+  const transactionStatus = stringFrom(executed.transactionStatus).toLowerCase();
+  const paid = transactionStatus === 'completed' || Boolean(trxID);
+  const updated = await updatePaymentSession(paymentId, {
+    status: paid ? 'paid' : 'failed',
+    transaction_id: trxID || null,
+    raw_execute: executed,
+    last_error: paid ? null : stringFrom(executed.statusMessage) || 'bKash payment was not completed.',
+    updated_at: new Date().toISOString(),
+  });
+  if (!paid) {
+    throw new ApiError(402, 'bKash payment was not completed.', executed);
+  }
+  return updated;
+}
+
+async function queryBkashPayment(paymentId: string) {
+  return bkashRequest('/payment/status', { paymentID: paymentId }, bkashCredentials());
+}
+
+async function bkashRequest(
+  endpoint: string,
+  body: JsonMap,
+  credentials: BkashCredentials,
+) {
+  const token = await grantBkashToken(credentials);
+  const response = await fetch(`${credentials.baseUrl}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': token,
+      'X-App-Key': credentials.appKey,
+    },
+    body: JSON.stringify(body),
+  });
+  const jsonBody = await readResponseJson(response);
+  if (!response.ok || stringFrom(jsonBody.errorCode)) {
+    throw new ApiError(
+      response.ok ? 502 : response.status,
+      stringFrom(jsonBody.errorMessage) ||
+        stringFrom(jsonBody.statusMessage) ||
+        'bKash request failed.',
+      jsonBody,
+    );
+  }
+  return jsonBody;
+}
+
+async function grantBkashToken(credentials: BkashCredentials) {
+  const response = await fetch(`${credentials.baseUrl}/token/grant`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'username': credentials.username,
+      'password': credentials.password,
+    },
+    body: JSON.stringify({
+      app_key: credentials.appKey,
+      app_secret: credentials.appSecret,
+    }),
+  });
+  const jsonBody = await readResponseJson(response);
+  const token = stringFrom(jsonBody.id_token ?? jsonBody.idToken);
+  if (!response.ok || !token) {
+    throw new ApiError(
+      response.ok ? 502 : response.status,
+      stringFrom(jsonBody.errorMessage) ||
+        stringFrom(jsonBody.statusMessage) ||
+        'bKash token grant failed.',
+      jsonBody,
+    );
+  }
+  return token;
 }
 
 async function bootstrapTenant(request: Request): Promise<ActionResult> {
@@ -776,6 +1004,139 @@ async function applySyncEvent(outletId: string, event: SyncEventInput) {
   return { eventId: event.id, entityType: event.entityType, skipped: true };
 }
 
+function bkashCredentials(): BkashCredentials {
+  const mode = Deno.env.get('BKASH_MODE')?.trim() || 'sandbox';
+  const defaultSandboxUrl =
+    'https://tokenized.sandbox.bka.sh/v1.2.0-beta/tokenized/checkout';
+  const baseUrl = Deno.env.get('BKASH_BASE_URL')?.trim() ||
+    (mode === 'sandbox' ? defaultSandboxUrl : '');
+  const appKey = Deno.env.get('BKASH_APP_KEY')?.trim() ?? '';
+  const appSecret = Deno.env.get('BKASH_APP_SECRET')?.trim() ?? '';
+  const username = Deno.env.get('BKASH_USERNAME')?.trim() ?? '';
+  const password = Deno.env.get('BKASH_PASSWORD')?.trim() ?? '';
+  if (!baseUrl || !appKey || !appSecret || !username || !password) {
+    throw new ApiError(
+      503,
+      'bKash sandbox secrets are not configured in Supabase.',
+    );
+  }
+  return {
+    mode,
+    baseUrl: baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl,
+    appKey,
+    appSecret,
+    username,
+    password,
+  };
+}
+
+function bkashCallbackUrl(request: Request) {
+  const configured = Deno.env.get('BKASH_CALLBACK_URL')?.trim();
+  if (configured) return configured;
+  const url = new URL(request.url);
+  const marker = '/payments/bkash/create';
+  const index = url.pathname.indexOf(marker);
+  const basePath = index >= 0 ? url.pathname.slice(0, index) : '';
+  return `${url.origin}${basePath}/payments/bkash/callback`;
+}
+
+function buildBkashInvoice(serverId: string) {
+  const safeServer = serverId.replaceAll(/[^a-zA-Z0-9]/g, '').slice(0, 12) ||
+    'server';
+  const stamp = new Date().toISOString().replace(/\D/g, '').slice(2, 14);
+  const suffix = crypto.randomUUID().split('-')[0].toUpperCase();
+  return `POS-${safeServer}-${stamp}-${suffix}`;
+}
+
+async function maybePaymentSession(paymentId: string) {
+  const { data, error } = await db()
+    .from('payment_sessions')
+    .select('*')
+    .eq('payment_id', paymentId)
+    .maybeSingle();
+  throwIf(error);
+  return data;
+}
+
+async function updatePaymentSession(paymentId: string, patch: JsonMap) {
+  return updateSingle('payment_sessions', patch, { payment_id: paymentId });
+}
+
+function mapPaymentSession(row: JsonMap) {
+  return {
+    id: row.id,
+    serverId: row.server_id,
+    provider: row.provider,
+    mode: row.mode,
+    purpose: row.purpose,
+    amount: Number(row.amount),
+    currency: row.currency,
+    merchantInvoiceNumber: row.merchant_invoice_number,
+    paymentId: row.payment_id,
+    transactionId: row.transaction_id,
+    checkoutUrl: row.checkout_url,
+    status: row.status,
+    paid: row.status === 'paid',
+    lastError: row.last_error,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
+}
+
+async function readResponseJson(response: Response): Promise<JsonMap> {
+  const raw = await response.text();
+  if (!raw.trim()) return {};
+  try {
+    return asMap(JSON.parse(raw));
+  } catch (_) {
+    throw new ApiError(
+      502,
+      'Payment provider returned an invalid JSON response.',
+      raw.slice(0, 500),
+    );
+  }
+}
+
+async function safeCallbackBody(request: Request): Promise<JsonMap> {
+  if (request.method === 'GET') return {};
+  try {
+    return await readJson(request);
+  } catch (_) {
+    return {};
+  }
+}
+
+function stringFrom(value: unknown) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function paymentHtml(message: string, success: boolean) {
+  const color = success ? '#008C76' : '#E0264D';
+  const title = success ? 'Payment Successful' : 'Payment Incomplete';
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${title}</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f8f5; color: #111b20; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+    main { max-width: 440px; width: 100%; background: #fff; border: 1px solid #e3e8e4; border-radius: 24px; padding: 28px; box-shadow: 0 18px 48px rgba(15,42,31,.12); text-align: center; }
+    .mark { width: 64px; height: 64px; border-radius: 20px; margin: 0 auto 18px; display: grid; place-items: center; background: ${color}; color: white; font-size: 34px; font-weight: 900; }
+    h1 { margin: 0 0 10px; font-size: 24px; }
+    p { margin: 0; color: #5c6b6b; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark">${success ? '&check;' : '!'}</div>
+    <h1>${title}</h1>
+    <p>${message}</p>
+  </main>
+</body>
+</html>`;
+}
+
 async function ensureRestaurantOutlet(input: {
   restaurantId: string;
   outletId: string;
@@ -1218,7 +1579,7 @@ function requiredSegment(value: string | undefined, name: string) {
 }
 
 function requireString(value: unknown, name: string) {
-  if (typeof value !== 'string' || value.trim().isEmpty) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
     throw new ApiError(400, `${name} is required.`);
   }
   return value.trim();
@@ -1334,7 +1695,7 @@ function canTransitionOrderStatus(current: string, next: string) {
   return statusPriority[next] >= statusPriority[current];
 }
 
-function parseOptionalDate(value: string | null) {
+function parseOptionalDate(value: string | null | undefined) {
   if (!value?.trim()) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
@@ -1364,6 +1725,16 @@ function json(body: unknown, statusCode = 200) {
   return new Response(JSON.stringify(body), {
     status: statusCode,
     headers: responseHeaders(),
+  });
+}
+
+function html(body: string, statusCode = 200) {
+  return new Response(body, {
+    status: statusCode,
+    headers: {
+      ...responseHeaders(),
+      'Content-Type': 'text/html; charset=utf-8',
+    },
   });
 }
 
