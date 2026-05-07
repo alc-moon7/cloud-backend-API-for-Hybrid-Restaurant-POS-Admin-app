@@ -23,6 +23,8 @@ export type OrderInput = {
   customerName?: string | null;
   tableNo?: string | null;
   note?: string | null;
+  customerLatitude?: number;
+  customerLongitude?: number;
   status?: string;
   total?: number;
   items: OrderInputItem[];
@@ -77,6 +79,7 @@ export async function upsertOrder(outletId: string, input: OrderInput) {
   if (!input.items.length) throw badRequest('Order must include at least one item.');
 
   return withTransaction(async (client) => {
+    await assertPublicOrderWithinGeofence(client, outletId, input);
     const orderId = input.id ?? randomUUID();
     const existing = await client.query('SELECT * FROM orders WHERE id = $1', [
       orderId,
@@ -161,6 +164,66 @@ export async function upsertOrder(outletId: string, input: OrderInput) {
 
     return mapOrderRow(result.rows[0], preparedItems.map(itemToRow));
   });
+}
+
+async function assertPublicOrderWithinGeofence(
+  client: DbClient,
+  outletId: string,
+  input: OrderInput,
+) {
+  const config = await client.query(
+    `
+      SELECT
+        gps_latitude,
+        gps_longitude,
+        gps_radius_meters,
+        gps_enforcement_enabled
+      FROM outlet_configs
+      WHERE outlet_id = $1
+      LIMIT 1
+    `,
+    [outletId],
+  );
+
+  if (!config.rowCount) return;
+  const row = config.rows[0];
+  const enforcementEnabled = Boolean(row.gps_enforcement_enabled ?? false);
+  const centerLat = row.gps_latitude == null ? null : Number(row.gps_latitude);
+  const centerLng = row.gps_longitude == null ? null : Number(row.gps_longitude);
+  const radiusMeters = row.gps_radius_meters == null ? null : Number(row.gps_radius_meters);
+  const configured =
+    enforcementEnabled &&
+    centerLat != null &&
+    centerLng != null &&
+    radiusMeters != null &&
+    Number.isFinite(centerLat) &&
+    Number.isFinite(centerLng) &&
+    Number.isFinite(radiusMeters) &&
+    radiusMeters > 0;
+
+  if (!configured) return;
+
+  if (input.customerLatitude == null || input.customerLongitude == null) {
+    throw badRequest('Customer location is required to order from this restaurant.', {
+      code: 'LOCATION_REQUIRED',
+    });
+  }
+
+  const distanceMeters = haversineMeters(
+    centerLat as number,
+    centerLng as number,
+    input.customerLatitude,
+    input.customerLongitude,
+  );
+
+  const allowedRadiusMeters = radiusMeters as number;
+  if (distanceMeters > allowedRadiusMeters) {
+    throw badRequest('You are outside the allowed ordering range for this restaurant.', {
+      code: 'OUTSIDE_GEOFENCE',
+      distanceMeters,
+      allowedRadiusMeters,
+    });
+  }
 }
 
 export async function updateOrderStatus(
@@ -292,4 +355,23 @@ function buildOrderNo() {
 function clean(value: string | null | undefined) {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function haversineMeters(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number,
+) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const earthRadiusMeters = 6371000;
+  const dLat = toRadians(lat2 - lat1);
+  const dLng = toRadians(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRadians(lat1)) *
+      Math.cos(toRadians(lat2)) *
+      Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusMeters * c;
 }

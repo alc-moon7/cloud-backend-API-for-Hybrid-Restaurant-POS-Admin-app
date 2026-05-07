@@ -17,7 +17,7 @@ const syncEventSchema = z.object({
   entityType: z.string().min(1),
   entityId: z.string().min(1),
   action: z.string().min(1),
-  payload: z.record(z.unknown()).optional(),
+  payload: z.record(z.string(), z.unknown()).optional(),
   payloadJson: z.string().optional(),
   status: z.string().optional(),
   retryCount: z.number().int().nonnegative().optional(),

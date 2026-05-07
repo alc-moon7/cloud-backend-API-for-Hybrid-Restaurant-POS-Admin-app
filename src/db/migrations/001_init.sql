@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS outlets (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE restaurants
+  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
   restaurant_id TEXT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
@@ -106,6 +109,16 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS tables (
+  id TEXT PRIMARY KEY,
+  outlet_id TEXT NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  seats INTEGER NOT NULL DEFAULT 4 CHECK (seats > 0),
+  status TEXT NOT NULL DEFAULT 'available',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_menu_items_outlet_updated
   ON menu_items(outlet_id, updated_at DESC);
 
@@ -121,3 +134,6 @@ CREATE INDEX IF NOT EXISTS idx_sync_events_outlet_updated
 CREATE INDEX IF NOT EXISTS idx_devices_outlet_token
   ON devices(outlet_id, device_token_hash)
   WHERE device_token_hash IS NOT NULL AND is_active = true;
+
+CREATE INDEX IF NOT EXISTS idx_tables_outlet_name
+  ON tables(outlet_id, name);

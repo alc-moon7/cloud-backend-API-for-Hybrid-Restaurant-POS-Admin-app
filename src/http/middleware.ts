@@ -6,7 +6,18 @@ import { HttpError, unauthorized } from '../shared/http-error.js';
 
 export const authMiddleware: RequestHandler = (request, _response, next) => {
   if (!env.deviceApiToken) return next();
-  if (request.path === '/health') return next();
+  if (
+    request.path === '/health' ||
+    request.path === '/api/v1/health' ||
+    request.path.startsWith('/owner/') ||
+    request.path.startsWith('/api/v1/owner/') ||
+    request.path === '/staff/auth/login' ||
+    request.path === '/api/v1/staff/auth/login' ||
+    /^\/(?:api\/v1\/)?outlets\/[^/]+\/menu(?:\/.*)?$/.test(request.path) ||
+    /^\/(?:api\/v1\/)?outlets\/[^/]+\/orders(?:\/.*)?$/.test(request.path)
+  ) {
+    return next();
+  }
 
   const header = request.header('authorization') ?? '';
   const expected = `Bearer ${env.deviceApiToken}`;
@@ -37,6 +48,7 @@ export const errorMiddleware: ErrorRequestHandler = (
   response.status(statusCode).json({
     ok: false,
     error: error instanceof Error ? error.message : 'Internal server error.',
+    detail: error instanceof Error ? error.message : 'Internal server error.',
     details: error instanceof HttpError ? error.details : undefined,
   });
 };

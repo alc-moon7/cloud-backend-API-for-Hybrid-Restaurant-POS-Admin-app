@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -6,11 +6,15 @@ import { pool } from './pool.js';
 
 async function main() {
   const currentDir = dirname(fileURLToPath(import.meta.url));
-  const sql = await readFile(
-    join(currentDir, 'migrations', '001_init.sql'),
-    'utf8',
-  );
-  await pool.query(sql);
+  const migrationsDir = join(currentDir, 'migrations');
+  const files = (await readdir(migrationsDir))
+    .filter((entry) => entry.endsWith('.sql'))
+    .sort();
+
+  for (const file of files) {
+    const sql = await readFile(join(migrationsDir, file), 'utf8');
+    await pool.query(sql);
+  }
   await pool.end();
   console.log('Database migration completed.');
 }

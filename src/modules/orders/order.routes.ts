@@ -31,6 +31,8 @@ const orderSchema = z.object({
   customerName: z.string().optional().nullable(),
   tableNo: z.string().optional().nullable(),
   note: z.string().optional().nullable(),
+  customerLatitude: z.number().min(-90).max(90).optional(),
+  customerLongitude: z.number().min(-180).max(180).optional(),
   status: z.enum(orderStatuses as [string, ...string[]]).optional(),
   total: z.number().nonnegative().optional(),
   items: z.array(orderItemSchema).min(1),

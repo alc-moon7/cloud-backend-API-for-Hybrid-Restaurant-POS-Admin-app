@@ -1,5 +1,5 @@
 import cors from 'cors';
-import express from 'express';
+import express, { Router } from 'express';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import swaggerUi from 'swagger-ui-express';
@@ -14,12 +14,16 @@ import {
 } from './http/middleware.js';
 import { deviceRouter } from './modules/devices/device.routes.js';
 import { menuRouter } from './modules/menu/menu.routes.js';
+import { ownerRouter, staffAuthRouter } from './modules/owner/owner.routes.js';
 import { orderRouter } from './modules/orders/order.routes.js';
+import { publicRouter } from './modules/public/public.routes.js';
+import { staffRouter } from './modules/staff/staff.routes.js';
 import { syncRouter } from './modules/sync/sync.routes.js';
 import { connectedClientCount } from './realtime/hub.js';
 
 export function createApp() {
   const app = express();
+  const api = Router();
 
   app.get('/openapi.json', (_request, response) => {
     response.json(openApiSpec);
@@ -47,7 +51,7 @@ export function createApp() {
   app.use(morgan(env.nodeEnv === 'production' ? 'combined' : 'dev'));
   app.use(authMiddleware);
 
-  app.get('/health', async (_request, response) => {
+  api.get('/health', async (_request, response) => {
     const startedAt = Date.now();
     try {
       await pool.query('SELECT 1');
@@ -73,10 +77,17 @@ export function createApp() {
     }
   });
 
-  app.use('/devices', deviceRouter);
-  app.use('/outlets/:outletId/menu', menuRouter);
-  app.use('/outlets/:outletId/orders', orderRouter);
-  app.use('/outlets/:outletId/sync', syncRouter);
+  api.use('/owner', ownerRouter);
+  api.use('/staff/auth', staffAuthRouter);
+  api.use('/staff', staffRouter);
+  api.use('/devices', deviceRouter);
+  api.use('/outlets/:outletId/bootstrap', publicRouter);
+  api.use('/outlets/:outletId/menu', menuRouter);
+  api.use('/outlets/:outletId/orders', orderRouter);
+  api.use('/outlets/:outletId/sync', syncRouter);
+
+  app.use(api);
+  app.use('/api/v1', api);
 
   app.use(notFoundMiddleware);
   app.use(errorMiddleware);
