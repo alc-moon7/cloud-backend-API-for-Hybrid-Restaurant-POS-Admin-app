@@ -120,6 +120,14 @@ Deno.serve(async (request) => {
       return json(await health());
     }
 
+    if (
+      request.method === 'POST' &&
+      segments[0] === 'admin' &&
+      segments[1] === 'login'
+    ) {
+      return json((await loginAdminAccount(request)).body);
+    }
+
     if (segments[0] === 'payments' && segments[1] === 'bkash') {
       if (request.method === 'POST' && segments[2] === 'create') {
         return await withIdempotency(request, () => createBkashPayment(request));
@@ -167,6 +175,14 @@ Deno.serve(async (request) => {
       segments[1] === 'heartbeat'
     ) {
       return json((await heartbeatDevice(request)).body);
+    }
+
+    if (
+      request.method === 'GET' &&
+      segments[0] === 'outlets' &&
+      segments[2] === 'bootstrap'
+    ) {
+      return json(await getOutletBootstrap(requiredSegment(segments[1], 'outletId')));
     }
 
     if (segments[0] === 'outlets' && segments[2] === 'menu') {
@@ -514,6 +530,127 @@ async function grantBkashToken(credentials: BkashCredentials) {
   return token;
 }
 
+async function loginAdminAccount(request: Request): Promise<ActionResult> {
+  const body = await readJson(request);
+  const identifier = (
+    optionalString(body.usernameOrEmail, 'usernameOrEmail') ??
+      optionalString(body.email, 'email') ??
+      optionalString(body.username, 'username')
+  )?.toLowerCase();
+  if (!identifier) {
+    throw new ApiError(400, 'usernameOrEmail is required.');
+  }
+  const password = requireString(body.password, 'password');
+  const serverId = optionalString(body.serverId, 'serverId') ?? makePublicId('server');
+
+  const account = await findAdminAccount(identifier);
+  if (!account || account.is_active !== true) {
+    throw new ApiError(401, 'Invalid username/email or password.');
+  }
+
+  const passwordHash = await sha256Hex(
+    `${password}:${String(account.password_salt)}`,
+  );
+  if (passwordHash !== String(account.password_hash)) {
+    throw new ApiError(401, 'Invalid username/email or password.');
+  }
+
+  const restaurantId = String(account.restaurant_id);
+  const outletId = String(account.outlet_id);
+  const restaurantName = await restaurantNameFor(restaurantId);
+  const outletName = await outletNameFor(outletId);
+  const now = new Date().toISOString();
+  const deviceToken = makeDeviceToken();
+  const tokenHash = await sha256Hex(deviceToken);
+
+  await ensureRestaurantOutlet({
+    restaurantId,
+    outletId,
+    restaurantName,
+    outletName,
+    updateNames: false,
+  });
+
+  const device = await upsertSingle('devices', {
+    id: serverId,
+    restaurant_id: restaurantId,
+    outlet_id: outletId,
+    restaurant_name: restaurantName,
+    outlet_name: outletName,
+    device_token_hash: tokenHash,
+    token_issued_at: now,
+    is_active: true,
+    updated_at: now,
+  });
+
+  await broadcastToOutlet(outletId, 'device_registered', {
+    ...device,
+    device_token_hash: undefined,
+  });
+
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      data: {
+        account: {
+          id: account.id,
+          email: account.email,
+          username: account.username,
+          role: account.role,
+        },
+        serverId,
+        restaurantId,
+        outletId,
+        restaurantName,
+        outletName,
+        deviceToken,
+        cloudSyncEnabled: true,
+      },
+    },
+  };
+}
+
+async function findAdminAccount(identifier: string) {
+  const fields =
+    'id, restaurant_id, outlet_id, email, username, password_salt, password_hash, role, is_active';
+  const emailResult = await db()
+    .from('admin_accounts')
+    .select(fields)
+    .eq('email', identifier)
+    .maybeSingle();
+  throwIf(emailResult.error);
+  if (emailResult.data) return emailResult.data as JsonMap;
+
+  const usernameResult = await db()
+    .from('admin_accounts')
+    .select(fields)
+    .eq('username', identifier)
+    .maybeSingle();
+  throwIf(usernameResult.error);
+  return usernameResult.data as JsonMap | null;
+}
+
+async function restaurantNameFor(restaurantId: string) {
+  const { data, error } = await db()
+    .from('restaurants')
+    .select('name')
+    .eq('id', restaurantId)
+    .maybeSingle();
+  throwIf(error);
+  return stringFrom(data?.name) || restaurantId;
+}
+
+async function outletNameFor(outletId: string) {
+  const { data, error } = await db()
+    .from('outlets')
+    .select('name')
+    .eq('id', outletId)
+    .maybeSingle();
+  throwIf(error);
+  return stringFrom(data?.name) || outletId;
+}
+
 async function bootstrapTenant(request: Request): Promise<ActionResult> {
   const body = await readJson(request);
   const serverId = requireString(body.serverId, 'serverId');
@@ -646,6 +783,48 @@ async function listMenu(outletId: string, url: URL) {
   throwIf(error);
   const items = (data ?? []).map(mapMenuRow);
   return { ok: true, count: items.length, data: items };
+}
+
+async function getOutletBootstrap(outletId: string) {
+  const { data: outlet, error: outletError } = await db()
+    .from('outlets')
+    .select('id, name, restaurant_id')
+    .eq('id', outletId)
+    .maybeSingle();
+  throwIf(outletError);
+  if (!outlet) throw new ApiError(404, 'Outlet not found.');
+
+  const restaurantId = String(outlet.restaurant_id);
+  const { data: restaurant, error: restaurantError } = await db()
+    .from('restaurants')
+    .select('id, name')
+    .eq('id', restaurantId)
+    .maybeSingle();
+  throwIf(restaurantError);
+
+  return {
+    ok: true,
+    data: {
+      restaurant: {
+        id: restaurant?.id ?? restaurantId,
+        name: restaurant?.name ?? 'Restaurant',
+      },
+      outlet: {
+        id: outlet.id,
+        name: outlet.name ?? 'Restaurant',
+        currency: 'BDT',
+        taxRate: 0,
+        prepTimeMinutes: null,
+      },
+      geofence: {
+        gpsEnforcementEnabled: false,
+        gpsConfigured: false,
+        gpsLatitude: null,
+        gpsLongitude: null,
+        gpsRadiusMeters: null,
+      },
+    },
+  };
 }
 
 async function createMenuItem(

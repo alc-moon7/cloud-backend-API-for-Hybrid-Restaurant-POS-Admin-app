@@ -165,6 +165,7 @@ single generated payment session. Production code must always call
 ### Supabase API endpoints
 
 - `GET /health`
+- `POST /admin/login`
 - `POST /payments/bkash/create`
 - `GET /payments/bkash/:paymentId/status`
 - `POST /payments/bkash/:paymentId/verify`
@@ -172,6 +173,7 @@ single generated payment session. Production code must always call
 - `POST /tenants/bootstrap`
 - `POST /devices/register`
 - `POST /devices/heartbeat`
+- `GET /outlets/:outletId/bootstrap`
 - `GET /outlets/:outletId/menu`
 - `POST /outlets/:outletId/menu/images`
 - `POST /outlets/:outletId/menu`
@@ -200,9 +202,48 @@ Admin-only endpoints require the device token issued by
 
 Customer-facing endpoints remain public by `outletId`:
 
+- `GET /outlets/:outletId/bootstrap`
 - `GET /outlets/:outletId/menu`
 - `POST /outlets/:outletId/orders`
 - `GET /outlets/:outletId/orders/:id`
+
+### Admin account login
+
+`POST /admin/login` authenticates a restaurant owner/admin account and returns
+the restaurant/outlet identity plus a private device token. The Admin APK stores
+that token locally and uses it for cloud sync/write APIs.
+
+Request:
+
+```json
+{
+  "usernameOrEmail": "zero@moonx.dev",
+  "password": "YOUR_PASSWORD",
+  "serverId": "device_or_app_server_id"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "account": {
+      "email": "zero@moonx.dev",
+      "username": "moonx",
+      "role": "owner"
+    },
+    "serverId": "device_or_app_server_id",
+    "restaurantId": "rest_c46f1be2fa034b11b0",
+    "outletId": "outlet_0884a3c2b8314bfb9c",
+    "restaurantName": "Moon Test 4",
+    "outletName": "Moon Test 4 Outlet",
+    "deviceToken": "posdt_...",
+    "cloudSyncEnabled": true
+  }
+}
+```
 
 ## Legacy: Express + PostgreSQL
 
